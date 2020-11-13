@@ -36,6 +36,8 @@ dependencies {
     implementation "com.android.support.constraint:constraint-layout:$constraint_layout_version"
     implementation "com.squareup.okhttp3:okhttp:$okhttp_version"
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    implementation 'com.google.code.gson:gson:2.8.6'
+
 }
 repositories {
     mavenCentral()

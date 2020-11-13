@@ -1,24 +1,22 @@
-package net.measurementlab.ndt7.android
+package com.kts.network.ndt7.android
 
 import android.support.annotation.CheckResult
 import android.util.Log
 import com.google.gson.Gson
+import net.measurementlab.ndt7.android.model.ServerInfo
 
+import okhttp3.*
+import okio.ByteString
 import java.net.URI
 import java.net.URISyntaxException
+import java.net.URLEncoder
 import java.security.cert.X509Certificate
+import java.util.*
 import java.util.concurrent.TimeUnit
-
+import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
-
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
 
 // TODO(bassosimone): do we need locking for this class?
 
@@ -28,8 +26,8 @@ open class Client(private val settings: Settings) : WebSocketListener() {
 
     private val gson = Gson()
     private val measurementInterval = TimeUnit.NANOSECONDS.convert(250, TimeUnit.MILLISECONDS)
-
-    private var count = 0.0
+    private var currentBytes: Long = 0
+    private var count: Long = 0
     private var rv = true
     private var t0: Long = 0
     private var tLast: Long = 0
@@ -38,33 +36,40 @@ open class Client(private val settings: Settings) : WebSocketListener() {
         Log.d(TAG, "onLogInfo: $message")
     }
 
-    open fun onError(error: String?) {
-        Log.d(TAG, "onError: $error")
+    open fun onError(error: Throwable?) {
+        if (error != null) {
+            Log.e(TAG, "onError: " + error.message)
+        }
     }
 
-    open fun onServerDownloadMeasurement(measurement: Measurement) {
-        Log.d(TAG, "onServerDownloadMeasurement: $measurement")
+    open fun onServerDownloadMeasurement(measurement: ServerInfo) {
+//        Log.d(TAG, "onServerDownloadMeasurement: $measurement.")
     }
 
     open fun onClientDownloadMeasurement(measurement: Measurement) {
-        Log.d(TAG, "onClientDownloadMeasurement: $measurement")
+//        Log.d(TAG, "onClientDownloadMeasurement: $measurement")
     }
 
-    override fun onOpen(ws: WebSocket?,
-                        resp: Response?) {
+    open fun onDownloadClose() {
+        Log.d(TAG, "onDownloadClose")
+
+    }
+
+    override fun onOpen(ws: WebSocket,
+                        resp: Response) {
         onLogInfo("WebSocket onOpen")
     }
 
-    override fun onMessage(ws: WebSocket?,
+    override fun onMessage(ws: WebSocket,
                            text: String) {
-        onLogInfo("WebSocket onMessage")
-        count += text.length.toDouble()
-        periodic()
+        onLogInfo("WebSocket onMessage$text")
+//        count += text.length.toDouble()
+//        periodic(bytes.size.toLong())
 
-        val measurement: Measurement
+        val measurement: ServerInfo
 
         try {
-            measurement = gson.fromJson(text, Measurement::class.java)
+            measurement = gson.fromJson(text, ServerInfo::class.java)
         } catch (e: Exception) {
             Log.e(TAG, "could not parse json", e)
             return
@@ -73,24 +78,25 @@ open class Client(private val settings: Settings) : WebSocketListener() {
         onServerDownloadMeasurement(measurement)
     }
 
-    override fun onMessage(ws: WebSocket?,
+    override fun onMessage(ws: WebSocket,
                            bytes: ByteString) {
-        count += bytes.size().toDouble()
-        periodic()
+//        onLogInfo("WebSocket onMessageBytes" + bytes.size.toDouble() )
+        periodic(bytes.size().toLong())
     }
 
     override fun onClosing(ws: WebSocket,
                            code: Int,
-                           reason: String?) {
+                           reason: String) {
         // TODO(bassosimone): make sure code has the correct value otherwise
         // we must return an error to the caller.
+        onDownloadClose()
         ws.close(1000, null)
     }
 
-    override fun onFailure(ws: WebSocket?,
+    override fun onFailure(ws: WebSocket,
                            t: Throwable,
                            r: Response?) {
-        onError(t.message)
+        onError(t)
         rv = false
     }
 
@@ -104,11 +110,13 @@ open class Client(private val settings: Settings) : WebSocketListener() {
                     settings.hostname,
                     if (settings.port in 0..65535) settings.port else -1,
                     "/ndt/v7/download",
-                    "", null
+                    makeQuery(), settings.accessToken
             )
+            Log.v(TAG, "uri.getRawQuery()" + uri.rawQuery + " uri.toString()" + uri.toString())
+
         } catch (e: URISyntaxException) {
             Log.e(TAG, "runDownload encountered exception", e)
-            onError(e.message)
+            onError(e)
             return false
         }
 
@@ -117,10 +125,12 @@ open class Client(private val settings: Settings) : WebSocketListener() {
         if (settings.skipTlsCertificateVerification) {
             val x509TrustManager = object : X509TrustManager {
                 override fun checkClientTrusted(chain: Array<X509Certificate>,
-                                                authType: String) {}
+                                                authType: String) {
+                }
 
                 override fun checkServerTrusted(chain: Array<X509Certificate>,
-                                                authType: String) {}
+                                                authType: String) {
+                }
 
                 override fun getAcceptedIssuers(): Array<X509Certificate> {
                     return arrayOf()
@@ -137,20 +147,19 @@ open class Client(private val settings: Settings) : WebSocketListener() {
                 Log.e(TAG, "Encountered exception while attempting to observe flag skipTlsCertificateVerification", e)
             }
 
-            builder.hostnameVerifier { _, _ -> true }
+            builder.hostnameVerifier(HostnameVerifier { _, _ -> true })
         }
 
         val client = builder
-                .connectTimeout(5, TimeUnit.SECONDS)
-                .readTimeout(5, TimeUnit.SECONDS)
-                .writeTimeout(5, TimeUnit.SECONDS)
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
                 .build()
 
         val request = Request.Builder()
                 .url(uri.toString())
                 .addHeader("Sec-WebSocket-Protocol", "net.measurementlab.ndt.v7")
                 .build()
-
         client.newWebSocket(request, this)
 
         tLast = System.nanoTime()
@@ -169,13 +178,37 @@ open class Client(private val settings: Settings) : WebSocketListener() {
         return rv
     }
 
-    private fun periodic() {
+    private fun periodic(current: Long) {
+        count += current
         val now = System.nanoTime()
 
+        currentBytes += current
+
         if (now - tLast > measurementInterval) {
-            val measurement = Measurement((now - t0).toDouble(), null, null, null)
+            val measurement = Measurement((now - t0).toDouble(), null, null, Measurement.AppInfo(count, currentBytes, (now - tLast).toDouble()))
             tLast = now
             onClientDownloadMeasurement(measurement)
+            currentBytes = 0;
         }
+    }
+
+     private fun makeQuery(): String? {
+        var s = ""
+         s += "access_token="
+//         s += URLEncoder.encode(settings.accessToken, "utf-8");
+        if (settings.adaptive) {
+            if (!s.isEmpty()) {
+                s += "&"
+            }
+            s += "adaptive=true"
+        }
+        if (settings.duration > 0) {
+            if (!s.isEmpty()) {
+                s += "&"
+            }
+            s += "duration="
+            s += Integer.toString(settings.duration)
+        }
+        return s
     }
 }
